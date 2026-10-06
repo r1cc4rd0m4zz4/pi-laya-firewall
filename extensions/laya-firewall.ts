@@ -521,6 +521,45 @@ function extractTargetedWindows(rawText: string, windowCharLimit = 800): string[
   return [head, tail];
 }
 
+let isWakingUp = false;
+
+async function ensureLayaAwake(): Promise<boolean> {
+  try {
+    const probe = await fetch(`${LAYA_SERVER_URL}/health`, { signal: AbortSignal.timeout(400) });
+    if (probe.ok) return true;
+  } catch {}
+
+  if (isWakingUp) {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const probe = await fetch(`${LAYA_SERVER_URL}/health`, { signal: AbortSignal.timeout(300) });
+        if (probe.ok) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  isWakingUp = true;
+  try {
+    const ctlCmd = "laya-ctl start 2>/dev/null || python3 scripts/laya_ctl.py start 2>/dev/null || python3 ~/gitapp/laya-ctl/bin/laya-ctl start 2>/dev/null";
+    cp.execSync(ctlCmd, { timeout: 10000, stdio: "ignore" });
+
+    for (let i = 0; i < 25; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const probe = await fetch(`${LAYA_SERVER_URL}/health`, { signal: AbortSignal.timeout(300) });
+        if (probe.ok) return true;
+      } catch {}
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    isWakingUp = false;
+  }
+}
+
 async function queryLayaServe(
   state: string,
   targetModel: "multilingual" | "typed-decisions" | "english",
@@ -569,12 +608,26 @@ async function queryLayaServe(
   };
 
   try {
-    const res = await fetch(`${LAYA_SERVER_URL}/v1/systemone`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${LAYA_SERVER_URL}/v1/systemone`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } catch (netErr) {
+      // Possible hibernation: try auto-wake once
+      const awake = await ensureLayaAwake();
+      if (!awake) throw netErr;
+      res = await fetch(`${LAYA_SERVER_URL}/v1/systemone`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    }
+
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${res.statusText}`);
     }
