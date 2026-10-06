@@ -1,0 +1,32 @@
+{
+  "name": "pi-laya-firewall",
+  "version": "0.1.0",
+  "description": "Agent Application Firewall & Taint DAG for Pi Coding Agent using local Laya inference",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "security",
+    "firewall",
+    "guardrails",
+    "taint-tracking",
+    "dlp",
+    "ssrf-protection",
+    "laya"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "python3 tests/test_regression.py"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/laya-firewall.ts"
+    ]
+  },
+  "files": [
+    "extensions/laya-firewall.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
