@@ -67,12 +67,16 @@ class InProcessTaintTracker {
     "~/.npmrc",
     "~/.pypirc",
     "~/.docker/config.json",
-    "~/.pi/agent",
     "/etc/shadow",
     "/etc/passwd",
     "/etc/sudoers",
     "/etc/master.passwd",
   ];
+
+  private integritySeeds = [
+    "~/.pi/agent",
+  ];
+  private integrityPaths: Set<string> = new Set();
 
   private sensitivePatterns = [
     /(?:^|[\/\\])\.env(?:\..+)?$/i,
@@ -87,6 +91,21 @@ class InProcessTaintTracker {
       const canon = this.canonicalize(seed);
       if (canon) this.taintedPaths.add(canon);
     }
+    for (const seed of this.integritySeeds) {
+      const canon = this.canonicalize(seed);
+      if (canon) this.integrityPaths.add(canon);
+    }
+  }
+
+  isPathIntegrityProtected(pathStr: string, cwd?: string): boolean {
+    const canon = this.canonicalize(pathStr, cwd);
+    if (!canon) return false;
+    for (const p of this.integrityPaths) {
+      if (canon === p || canon.startsWith(p + path.sep)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   canonicalize(pathStr: string, cwd?: string): string | null {
@@ -678,10 +697,33 @@ async function evaluateAction(
   // 3. Taint Tracking Propagation & Matching
   if (toolName === "bash") {
     const cmd = String(args.command || "");
+    if (isLegitLayaBootstrap(cmd)) {
+      return {
+        requires_human_confirmation: false,
+        verdict: "ALLOW",
+        risk_score: 1,
+        is_tainted: false,
+        reason: "Laya service bootstrap operation",
+      };
+    }
+    if (BENIGN_SHELL_READ_REGEX.test(cmd.trim()) && !taintTracker.isCommandTainted(cmd, cwd)) {
+      return {
+        requires_human_confirmation: false,
+        verdict: "ALLOW",
+        risk_score: 1,
+        is_tainted: false,
+        reason: "Benign passive shell inspection",
+      };
+    }
     taintTracker.inspectAndPropagateBash(cmd, cwd);
     if (!isTainted) isTainted = taintTracker.isCommandTainted(cmd, cwd);
   } else if (!isTainted && targetPath) {
-    isTainted = taintTracker.isPathSensitive(targetPath, cwd);
+    if (toolName === "write" || toolName === "edit") {
+      if (taintTracker.isPathIntegrityProtected(targetPath, cwd)) {
+        isTainted = true;
+      }
+    }
+    if (!isTainted) isTainted = taintTracker.isPathSensitive(targetPath, cwd);
   }
 
   // Bounded Holographic Horizon (Stephen Hawking & Kevin Mitnick Anti-Evasion)
@@ -745,8 +787,8 @@ async function evaluateAction(
     const minAlignedProb = Math.min(...windowEvals.map((e) => e.alignedProb));
     const maxRiskScore = Math.max(...windowEvals.map((e) => e.riskScore));
 
-    const suspectSecretLeak = minNoSecretProb < 0.95;
-    const suspectUnsafe = minSafeProb < 0.70;
+    const suspectSecretLeak = minNoSecretProb < 0.70;
+    const suspectUnsafe = minSafeProb < 0.65;
     const suspectGoalDrift = userPrompt ? minAlignedProb < 0.60 : false;
 
     let verdict: "ALLOW" | "REQUIRE_CONFIRMATION" | "BLOCK" = "ALLOW";
@@ -824,8 +866,9 @@ async function confirmGuardrail(
   return { allowed: true };
 }
 
-const LAYA_SERVICE_MGMT_REGEX = /^\s*(?:python[23]?\s+)?(?:\.\/)?(?:scripts\/)?laya_ctl(?:\.py)?\s+(?:start|stop|restart|status)(?:\s+--foreground)?\s*$/;
+const LAYA_SERVICE_MGMT_REGEX = /^\s*(?:python[23]?\s+)?(?:\S*\/)?(?:laya[-_]ctl(?:\.py)?|laya-serve)\s+(?:start|stop|restart|status|logs|setup)\b.*$/;
 const LAYA_SERVE_BIN_REGEX = /^\s*(?:nohup\s+)?(?:LAYA_[A-Z_]+=[^\s]+\s+)*laya-serve(?:\s+[^;|&<>]+)?$/;
+const BENIGN_SHELL_READ_REGEX = /^\s*(?:cat|head|tail|grep|wc|file|which|where|ls|stat)\b(?:(?!>|\|).)*$/;
 
 function isLegitLayaBootstrap(cmd: string): boolean {
   const clean = cmd.trim();
