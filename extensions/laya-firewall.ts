@@ -715,6 +715,15 @@ async function evaluateAction(
         reason: "Benign passive shell inspection",
       };
     }
+    if (isSafeLocalGitOperation(cmd) && !taintTracker.isCommandTainted(cmd, cwd)) {
+      return {
+        requires_human_confirmation: false,
+        verdict: "ALLOW",
+        risk_score: 1,
+        is_tainted: false,
+        reason: "Safe local git version control operation",
+      };
+    }
     taintTracker.inspectAndPropagateBash(cmd, cwd);
     if (!isTainted) isTainted = taintTracker.isCommandTainted(cmd, cwd);
   } else if (!isTainted && targetPath) {
@@ -873,6 +882,19 @@ const BENIGN_SHELL_READ_REGEX = /^\s*(?:cat|head|tail|grep|wc|file|which|where|l
 function isLegitLayaBootstrap(cmd: string): boolean {
   const clean = cmd.trim();
   return LAYA_SERVICE_MGMT_REGEX.test(clean) || LAYA_SERVE_BIN_REGEX.test(clean);
+}
+
+function isSafeLocalGitOperation(cmd: string): boolean {
+  if (/\b(?:push|remote\s+add|filter-branch)\b/i.test(cmd)) return false;
+  if (/(?:^|\s)(?:-f|--force)\b/i.test(cmd)) return false;
+
+  const parts = cmd.split(/\s*(?:&&|;)\s*/);
+  return parts.every((sub) => {
+    const trimmed = sub.trim();
+    if (!trimmed) return true;
+    if (/^cd\s+/i.test(trimmed)) return true;
+    return /^\s*git\s+(?:add|commit|status|diff|log|branch|checkout|switch|merge|rebase|stash|tag|rev-parse)\b/i.test(trimmed);
+  });
 }
 
 export default function (pi: ExtensionAPI) {
