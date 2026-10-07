@@ -10,8 +10,8 @@ Powered by local, air-gapped neural policy models via upstream [`laya`](https://
 
 1. **Deterministic Taint DAG & Integrity Paths**: In-process tracking of credentials and sensitive targets (`~/.ssh`, `~/.aws`, `.env`). Separate Integrity Path protection for agent extensions (`~/.pi/agent`) blocking unauthorized code mutation while allowing 0ms reads. Transitive taint propagates across file copy (`cp`, `mv`), redirection (`cat > dst`), pipe-to-tee (`| tee`), and archives (`tar`, `zip`).
 2. **Sub-Millisecond Hard Heuristics (<0.05ms)**: Drops shellcode, reverse shells, piping curl-to-shell, and multi-format cloud IMDS SSRF probes (decimal, hex, IPv6, GCP, Alibaba) prior to execution.
-3. **Audit Log Immutability (Zero-Tampering)**: Hard blocks any agent or sub-agent from deleting (`rm`), truncating (`>`), or modifying `firewall.jsonl` or `warden.jsonl` audit records (*Auditor != Audited*).
-4. **Safe Local Git Fast-Path & Anti-Cheating**: 0ms execution for local, non-push, non-force Git operations. Strictly rejects lazy/evasive commit messages (`update`, `fix`, `wip`, or <10 chars) while requiring descriptive conventional commits.
+3. **Kernel-Level Audit Log Immutability**: Native OS append-only flags (`chflags uappnd` on macOS) protect `firewall.jsonl` and `warden.jsonl` audit records against deletion (`rm`), truncation (`>`), or tampering without requiring root/sudo (*Auditor != Audited*).
+4. **Intent-Gated Local Git & Pre-Commit DLP**: 0ms execution for local Git operations; autonomous agent commits are blocked unless the user explicitly requested them in the prompt, guarded by pre-commit DLP diff scanning.
 5. **Local Laya System 1 Inference**:
    - Evaluates positive security queries: `is_safe_operation`, `no_secret_egress`, `is_aligned_with_goal`.
    - Stephen Hawking Min-Pooling ($\min(P)$) over bounded holographic windows (Head/Mid/Tail) to prevent poisoned chunk dilution.

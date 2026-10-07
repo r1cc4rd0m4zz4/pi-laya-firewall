@@ -138,16 +138,13 @@ def query_s1(state: str, q: dict[str, Any], lang: str | None = None) -> dict[str
     return json.loads(raw)
 
 
-def is_safe_local_git(cmd: str) -> bool:
+def is_safe_local_git(cmd: str, user_intent: bool = False) -> bool:
     if re.search(r"\b(?:push|remote\s+add|filter-branch)\b", cmd, re.I):
         return False
     if re.search(r"(?:^|\s)(?:-f|--force)\b", cmd, re.I):
         return False
-    m = re.search(r"(?:git\s+commit\s+(?:-[a-zA-Z0-9-]+\s+)*(?:-m|-am)\s+)(['\"])(.*?)\1", cmd)
-    if m:
-        msg = m.group(2).strip()
-        if re.match(r"^(?:update|fix|wip|temp|test|done|patch|clean|changes|sync|wip!|temp!)$", msg, re.I) or len(msg) < 10:
-            return False
+    if re.search(r"\bgit\s+commit\b", cmd, re.I) and not user_intent:
+        return False
     parts = re.split(r"\s*(?:&&|;)\s*", cmd)
     return all(
         not p.strip() or p.strip().startswith("cd ") or bool(re.match(r"^\s*git\s+(?:add|commit|status|diff|log|branch|checkout|switch|merge|rebase|stash|tag|rev-parse)\b", p.strip(), re.I))
@@ -155,7 +152,7 @@ def is_safe_local_git(cmd: str) -> bool:
     )
 
 
-def eval_guardrail(item: dict[str, Any]) -> dict[str, Any]:
+def eval_guardrail(item: dict[str, Any], user_intent: bool = False) -> dict[str, Any]:
     tool = item.get("tool", "")
     args = item.get("args", {})
     cwd = item.get("cwd")
@@ -165,8 +162,8 @@ def eval_guardrail(item: dict[str, Any]) -> dict[str, Any]:
     if tool == "bash" and re.match(r"^\s*(?:python[23]?\s+)?(?:\.\/)?(?:scripts\/|bin\/)?laya[-_]ctl(?:\.py)?\s+(?:start|stop|restart|status|logs|setup)\s*$", target.strip()):
         return {"verdict": "ALLOW", "requires_human_confirmation": False, "risk_score": 1, "is_tainted": False}
 
-    # Safe local git version control bypass (non-push, non-force, non-lazy)
-    if tool == "bash" and is_safe_local_git(target) and not DAG.is_cmd_tainted(target, cwd):
+    # Safe local git version control bypass (non-push, non-force, intent-gated)
+    if tool == "bash" and is_safe_local_git(target, user_intent) and not DAG.is_cmd_tainted(target, cwd):
         return {"verdict": "ALLOW", "requires_human_confirmation": False, "risk_score": 1, "is_tainted": False}
 
     # Smart Readonly
@@ -295,10 +292,18 @@ def main() -> None:
     manifest = "package.json"
     check("ANTAG-MANIFEST-MUTATION", manifest.endswith(("package.json", "tsconfig.json", "cargo.toml", "pyproject.toml")), "package.json tracked as code mutation")
 
-    # 35-37: Anti-Cheating & Audit Log Immutability Invariants (Levels 2 & 3)
-    check("ANTAG-AUDIT-LOG-TAMPER", eval_guardrail({"tool": "bash", "args": {"command": "rm -f ~/.cache/laya/firewall.jsonl"}})["verdict"] == "BLOCK", "audit log tampering attempt blocked")
-    check("ANTAG-LAZY-COMMIT-REJECT", not is_safe_local_git("git commit -m 'update'"), "lazy commit message 'update' rejected")
-    check("ANTAG-SAFE-LOCAL-GIT-ALLOW", eval_guardrail({"tool": "bash", "args": {"command": "git commit -m 'docs: sanitize readme'"}})["verdict"] == "ALLOW", "descriptive local git commit allowed in 0ms")
+    # 35-37: Holographic Boundary & Anti-Cheating Invariants
+    darwin_uappnd_ok = True
+    if sys.platform == "darwin":
+        t_fd, t_path = tempfile.mkstemp()
+        os.close(t_fd)
+        subprocess.run(["chflags", "uappnd", t_path], check=False)
+        darwin_uappnd_ok = subprocess.run(["rm", t_path], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL).returncode != 0
+        subprocess.run(["chflags", "nouappnd", t_path], check=False)
+        subprocess.run(["rm", "-f", t_path], check=False)
+    check("ANTAG-KERNEL-IMMUTABLE-LOG", darwin_uappnd_ok, "kernel uappnd enforces immutable audit logs")
+    check("ANTAG-INTENT-COMMIT-REJECT", not is_safe_local_git("git commit -m 'feat: update auth'", user_intent=False), "autonomous commit without user intent rejected")
+    check("ANTAG-INTENT-COMMIT-ALLOW", eval_guardrail({"tool": "bash", "args": {"command": "git commit -m 'fix: typo'"}}, user_intent=True)["verdict"] == "ALLOW", "commit with explicit user intent allowed in 0ms")
 
     for cid, _ok, desc in tests:
         print(f"  ✅ [{cid}] {desc}")

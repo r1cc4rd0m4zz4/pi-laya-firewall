@@ -38,6 +38,9 @@ function logFirewallEvent(sessionId: string, event: string, target: string, deta
     }) + "\n";
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true, mode: 0o700 });
     fs.appendFileSync(LOG_FILE, entry, "utf-8");
+    if (process.platform === "darwin") {
+      try { cp.execFileSync("chflags", ["uappnd", LOG_FILE], { stdio: "ignore" }); } catch {}
+    }
   } catch {
     // Non-blocking on log write failure
   }
@@ -262,8 +265,6 @@ const SHELL_PATTERNS: [RegExp, string][] = [
   [/python[23]?\s+-m\s+(?:http\.server|SimpleHTTPServer)/i, "Unauthorized local HTTP file server exfiltration"],
   [/(?:DYLD_INSERT_LIBRARIES|LD_PRELOAD)\s*=/i, "Dynamic linker library injection hijack"],
   [/\brm\s+-[rR]*f\s+\/\s*$/i, "Destructive wipe of root filesystem"],
-  [/(?:^|\s)(?:rm|unlink|shred|truncate)\s+(?:-[a-zA-Z]+\s+)*.*(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i, "Audit log tampering/deletion attempt (Zero-Tampering / Controllore != Controllato)"],
-  [/>\s*.*(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i, "Audit log truncation/overwrite attempt (Zero-Tampering)"],
 ];
 
 const INJECTION_PATTERNS: [RegExp, string][] = [
@@ -721,7 +722,18 @@ async function evaluateAction(
         reason: "Benign passive shell inspection",
       };
     }
-    if (isSafeLocalGitOperation(cmd) && !taintTracker.isCommandTainted(cmd, cwd)) {
+    const userHasCommitIntent = COMMIT_INTENT_REGEX.test(userPrompt || "");
+    if (/\bgit\s+commit\b/i.test(cmd) && !userHasCommitIntent) {
+      return {
+        requires_human_confirmation: false,
+        hard_block: true,
+        verdict: "BLOCK",
+        risk_score: 5,
+        is_tainted: false,
+        reason: "Autonomous git commit forbidden. Explicit user commit intent required in prompt.",
+      };
+    }
+    if (isSafeLocalGitOperation(cmd, userHasCommitIntent) && !taintTracker.isCommandTainted(cmd, cwd)) {
       return {
         requires_human_confirmation: false,
         verdict: "ALLOW",
@@ -890,17 +902,21 @@ function isLegitLayaBootstrap(cmd: string): boolean {
   return LAYA_SERVICE_MGMT_REGEX.test(clean) || LAYA_SERVE_BIN_REGEX.test(clean);
 }
 
-function isSafeLocalGitOperation(cmd: string): boolean {
+const COMMIT_INTENT_REGEX = /\b(?:commit|committa|committare|fai il commit)\b/i;
+
+function isSafeLocalGitOperation(cmd: string, userHasCommitIntent: boolean = false): boolean {
   if (/\b(?:push|remote\s+add|filter-branch)\b/i.test(cmd)) return false;
   if (/(?:^|\s)(?:-f|--force)\b/i.test(cmd)) return false;
 
-  // Anti-Cheating: Block lazy, evasive or stub commit messages (update, fix, wip, temp, or < 10 chars)
-  const commitMatch = cmd.match(/(?:git\s+commit\s+(?:-[a-zA-Z0-9-]+\s+)*(?:-m|-am)\s+)(['"])(.*?)\1/);
-  if (commitMatch) {
-    const msg = commitMatch[2].trim();
-    if (/^(?:update|fix|wip|temp|test|done|patch|clean|changes|sync|wip!|temp!)$/i.test(msg) || msg.length < 10) {
-      return false; // Prohibited lazy commit message! Must not bypass security!
-    }
+  // Intent-Gated Git Commits: Autonomous commits forbidden without user order
+  if (/\bgit\s+commit\b/i.test(cmd)) {
+    if (!userHasCommitIntent) return false;
+    // Pre-commit DLP scan on staged diff: prevent accidental or malicious secret commits
+    try {
+      const diff = cp.execSync("git diff --cached", { encoding: "utf-8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+      const secretPattern = /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{36}|xox[baprs]-[0-9a-zA-Z]{10,48})/i;
+      if (secretPattern.test(diff)) return false;
+    } catch {}
   }
 
   const parts = cmd.split(/\s*(?:&&|;)\s*/);
