@@ -262,6 +262,8 @@ const SHELL_PATTERNS: [RegExp, string][] = [
   [/python[23]?\s+-m\s+(?:http\.server|SimpleHTTPServer)/i, "Unauthorized local HTTP file server exfiltration"],
   [/(?:DYLD_INSERT_LIBRARIES|LD_PRELOAD)\s*=/i, "Dynamic linker library injection hijack"],
   [/\brm\s+-[rR]*f\s+\/\s*$/i, "Destructive wipe of root filesystem"],
+  [/(?:^|\s)(?:rm|unlink|shred|truncate)\s+(?:-[a-zA-Z]+\s+)*.*(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i, "Audit log tampering/deletion attempt (Zero-Tampering / Controllore != Controllato)"],
+  [/>\s*.*(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i, "Audit log truncation/overwrite attempt (Zero-Tampering)"],
 ];
 
 const INJECTION_PATTERNS: [RegExp, string][] = [
@@ -294,6 +296,10 @@ function checkHardHeuristics(toolName: string, args: Record<string, unknown>): s
 
   // Antagonistic Write / Edit Payload Inspection (MITRE T1059 / T1505 / CWE-94)
   if (toolName === "write" || toolName === "edit") {
+    const p = String(args.path || args.file || "");
+    if (/(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i.test(p)) {
+      return "Hard security violation: Unauthorized audit log overwrite attempt (Zero-Tampering / Controllore != Controllato)";
+    }
     let payload = "";
     if (typeof args.content === "string") {
       payload = args.content;
@@ -564,7 +570,7 @@ async function ensureLayaAwake(): Promise<boolean> {
     const ctlCmd = "laya-ctl start 2>/dev/null || python3 scripts/laya_ctl.py start 2>/dev/null || python3 ~/gitapp/laya-ctl/bin/laya-ctl start 2>/dev/null";
     cp.execSync(ctlCmd, { timeout: 10000, stdio: "ignore" });
 
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 35; i++) {
       await new Promise((r) => setTimeout(r, 200));
       try {
         const probe = await fetch(`${LAYA_SERVER_URL}/health`, { signal: AbortSignal.timeout(300) });
@@ -585,7 +591,7 @@ async function queryLayaServe(
   langParam: "it" | "en"
 ): Promise<Record<string, any>> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
+  const timer = setTimeout(() => controller.abort(), 12000);
 
   // Positive Formulation of Invariants: destroys context poisoning at the root
   // Explicit model dispatch: 'auto' is strictly eliminated to prevent language collapse
@@ -887,6 +893,15 @@ function isLegitLayaBootstrap(cmd: string): boolean {
 function isSafeLocalGitOperation(cmd: string): boolean {
   if (/\b(?:push|remote\s+add|filter-branch)\b/i.test(cmd)) return false;
   if (/(?:^|\s)(?:-f|--force)\b/i.test(cmd)) return false;
+
+  // Anti-Cheating: Block lazy, evasive or stub commit messages (update, fix, wip, temp, or < 10 chars)
+  const commitMatch = cmd.match(/(?:git\s+commit\s+(?:-[a-zA-Z0-9-]+\s+)*(?:-m|-am)\s+)(['"])(.*?)\1/);
+  if (commitMatch) {
+    const msg = commitMatch[2].trim();
+    if (/^(?:update|fix|wip|temp|test|done|patch|clean|changes|sync|wip!|temp!)$/i.test(msg) || msg.length < 10) {
+      return false; // Prohibited lazy commit message! Must not bypass security!
+    }
+  }
 
   const parts = cmd.split(/\s*(?:&&|;)\s*/);
   return parts.every((sub) => {

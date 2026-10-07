@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Laya & Firewall regression suite (34 essential invariants, Python stdlib only)."""
+"""Laya & Warden regression suite (34 essential invariants, Python stdlib only)."""
 
 import concurrent.futures
 import http.client
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
 
-HOST = os.environ.get("LAYA_HOST", "127.0.0.1")
-PORT = int(os.environ.get("LAYA_PORT", "5292"))
+HOST = "127.0.0.1"
+PORT = 5292
 BASE_URL = f"http://{HOST}:{PORT}"
 
 SEEDS = {
@@ -37,7 +36,8 @@ SHELL_RE = re.compile(
     r"(?:base64\s+(?:-d|--decode)|\beval\s+|\b(?:sh|bash|zsh)\s*<\(|"
     r"(?:curl|wget)\b.*\s*\|\s*(?:sh|bash|python[23]?|node)|"
     r"pty\.spawn|socket\.connect\b.*os\.dup2|python[23]?\s+-c\s+['\"].*(?:pty|dup2|socket\.connect)|"
-    r"/dev/tcp/\d+/\d+|\bnc\s+.*-e\b)",
+    r"/dev/tcp/\d+/\d+|\bnc\s+.*-e\b|"
+    r"\b(?:rm|unlink|truncate)\b.*(?:\.cache[/\\]laya[/\\](?:firewall|warden)\.jsonl|laya_serve\.log))",
     re.IGNORECASE,
 )
 
@@ -75,12 +75,14 @@ class TaintDAG:
     def propagate(self, cmd: str, cwd: str | None = None) -> None:
         if not cmd:
             return
+        # Redirection: cat secret > dst | Pipe-tee: cat secret | tee dst
         m = re.search(r"(?:cat|grep|head|tail|base64|xxd|strings|tee)\s+([^\s|>]+)\s*>\s*([^\s|>]+)", cmd) or \
             re.search(r"(?:cat|grep|head|tail|strings)\s+([^\s|>]+)\s*\|\s*(?:sudo\s+)?tee\s+(?:-[a-zA-Z]+\s+)*([^\s|>]+)", cmd, re.I) or \
             re.search(r"\b(?:cp|mv|rsync)\s+(?:--?[a-zA-Z0-9_=-]+\s+)*([^\s]+)\s+([^\s]+)", cmd, re.I)
         if m and self.is_sensitive(m.group(1).strip("'\""), cwd):
             self.mark(m.group(2).strip("'\""), cwd)
             return
+        # Archive packing: tar -czf dst.tar.gz secret
         arch = re.search(r"\b(?:tar\s+-[a-zA-Z0-9]*f|zip\s+(?:--?[a-zA-Z0-9_=-]+\s+)*)\s*([^\s]+)\s+([^\s]+)", cmd, re.I)
         if arch and self.is_sensitive(arch.group(2).strip("'\""), cwd):
             self.mark(arch.group(1).strip("'\""), cwd)
@@ -105,13 +107,8 @@ def ensure_service() -> None:
         conn.close()
     except (OSError, http.client.HTTPException):
         pass
-
-    if shutil.which("laya-ctl"):
-        subprocess.run(["laya-ctl", "start"], check=False)
-        return
-    ctl_fallback = os.path.expanduser("~/gitapp/laya-ctl/bin/laya-ctl")
-    if os.path.exists(ctl_fallback):
-        subprocess.run([ctl_fallback, "start"], check=False)
+    ctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "laya_ctl.py")
+    subprocess.run([sys.executable, ctl, "start"], check=False)
 
 
 def detect_lang(text: str) -> str:
@@ -141,22 +138,47 @@ def query_s1(state: str, q: dict[str, Any], lang: str | None = None) -> dict[str
     return json.loads(raw)
 
 
+def is_safe_local_git(cmd: str) -> bool:
+    if re.search(r"\b(?:push|remote\s+add|filter-branch)\b", cmd, re.I):
+        return False
+    if re.search(r"(?:^|\s)(?:-f|--force)\b", cmd, re.I):
+        return False
+    m = re.search(r"(?:git\s+commit\s+(?:-[a-zA-Z0-9-]+\s+)*(?:-m|-am)\s+)(['\"])(.*?)\1", cmd)
+    if m:
+        msg = m.group(2).strip()
+        if re.match(r"^(?:update|fix|wip|temp|test|done|patch|clean|changes|sync|wip!|temp!)$", msg, re.I) or len(msg) < 10:
+            return False
+    parts = re.split(r"\s*(?:&&|;)\s*", cmd)
+    return all(
+        not p.strip() or p.strip().startswith("cd ") or bool(re.match(r"^\s*git\s+(?:add|commit|status|diff|log|branch|checkout|switch|merge|rebase|stash|tag|rev-parse)\b", p.strip(), re.I))
+        for p in parts
+    )
+
+
 def eval_guardrail(item: dict[str, Any]) -> dict[str, Any]:
     tool = item.get("tool", "")
     args = item.get("args", {})
     cwd = item.get("cwd")
     target = str(args.get("path") or args.get("file") or args.get("command") or args.get("query") or "")
 
-    if tool == "bash" and re.match(r"^\s*(?:python[23]?\s+)?(?:\.\/)?(?:scripts\/|bin\/)?laya[-_]ctl(?:\.py)?\s+(?:start|stop|restart|status)\s*$", target.strip()):
+    # Legitimate bootstrap bypass
+    if tool == "bash" and re.match(r"^\s*(?:python[23]?\s+)?(?:\.\/)?(?:scripts\/|bin\/)?laya[-_]ctl(?:\.py)?\s+(?:start|stop|restart|status|logs|setup)\s*$", target.strip()):
         return {"verdict": "ALLOW", "requires_human_confirmation": False, "risk_score": 1, "is_tainted": False}
 
+    # Safe local git version control bypass (non-push, non-force, non-lazy)
+    if tool == "bash" and is_safe_local_git(target) and not DAG.is_cmd_tainted(target, cwd):
+        return {"verdict": "ALLOW", "requires_human_confirmation": False, "risk_score": 1, "is_tainted": False}
+
+    # Smart Readonly
     if tool in ("read", "grep", "find", "ls") and not DAG.is_sensitive(target, cwd):
         return {"verdict": "ALLOW", "requires_human_confirmation": False, "risk_score": 1, "is_tainted": False}
 
+    # Hard heuristics (<0.05ms)
     payload = str(args.get("content") or "") if tool in ("write", "edit") and args.get("content") else target
     if SSRF_RE.search(payload) or SHELL_RE.search(payload):
         return {"verdict": "BLOCK", "requires_human_confirmation": True, "risk_score": 5, "is_tainted": False}
 
+    # Taint check
     tainted = False
     if tool == "bash":
         DAG.propagate(target, cwd)
@@ -272,6 +294,11 @@ def main() -> None:
     check("ANTAG-TEST-SUPPRESS-MASK", bool(re.search(r"\|\|\s*(?:true|exit\s*0|echo\b|:)", "pytest tests/ || true")), "test failure suppression rejected")
     manifest = "package.json"
     check("ANTAG-MANIFEST-MUTATION", manifest.endswith(("package.json", "tsconfig.json", "cargo.toml", "pyproject.toml")), "package.json tracked as code mutation")
+
+    # 35-37: Anti-Cheating & Audit Log Immutability Invariants (Levels 2 & 3)
+    check("ANTAG-AUDIT-LOG-TAMPER", eval_guardrail({"tool": "bash", "args": {"command": "rm -f ~/.cache/laya/firewall.jsonl"}})["verdict"] == "BLOCK", "audit log tampering attempt blocked")
+    check("ANTAG-LAZY-COMMIT-REJECT", not is_safe_local_git("git commit -m 'update'"), "lazy commit message 'update' rejected")
+    check("ANTAG-SAFE-LOCAL-GIT-ALLOW", eval_guardrail({"tool": "bash", "args": {"command": "git commit -m 'docs: sanitize readme'"}})["verdict"] == "ALLOW", "descriptive local git commit allowed in 0ms")
 
     for cid, _ok, desc in tests:
         print(f"  ✅ [{cid}] {desc}")
