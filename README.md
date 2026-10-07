@@ -8,17 +8,19 @@ Powered by local, air-gapped neural policy models via upstream [`laya`](https://
 
 ## Architecture & Defense-in-Depth
 
-1. **Deterministic Taint DAG & Integrity Paths**: In-process tracking of credentials and sensitive targets (`~/.ssh`, `~/.aws`, `.env`). Separate Integrity Path protection for agent extensions (`~/.pi/agent`) blocking unauthorized code mutation while allowing 0ms reads. Transitive taint propagates across file copy (`cp`, `mv`), redirection (`cat > dst`), pipe-to-tee (`| tee`), and archives (`tar`, `zip`).
+1. **Deterministic Taint DAG & Multi-Step Staging Resilience**: In-process tracking of credentials and sensitive targets (`~/.ssh`, `~/.aws`, `.env`). Separate Integrity Path protection for agent extensions (`~/.pi/agent`) blocking unauthorized code mutation while allowing 0ms reads. Transitive taint propagates across file copy (`cp`, `mv`), stream transformations (`awk`, `sed`, `tr`, `base64`), input/output redirection (`> dst`, `< src`), pipe-to-tee (`| tee`), and archives (`tar`, `zip`, `7z`) across separate tool calls and prompt turns.
 2. **Sub-Millisecond Hard Heuristics (<0.05ms)**: Drops shellcode, reverse shells, piping curl-to-shell, and multi-format cloud IMDS SSRF probes (decimal, hex, IPv6, GCP, Alibaba) prior to execution.
-3. **Kernel-Level Audit Log Immutability**: Native OS append-only flags (`chflags uappnd` on macOS) protect `firewall.jsonl` and `warden.jsonl` audit records against deletion (`rm`), truncation (`>`), or tampering without requiring root/sudo (*Auditor != Audited*).
-4. **Intent-Gated Local Git & Pre-Commit DLP**: 0ms execution for local Git operations; autonomous agent commits are blocked unless the user explicitly requested them in the prompt, guarded by pre-commit DLP diff scanning.
-5. **Local Laya System 1 Inference**:
-   - Evaluates positive security queries: `is_safe_operation`, `no_secret_egress`, `is_aligned_with_goal`.
+3. **Chained Pipeline Atomicity Engine**: Decomposes compound shell pipelines (`&&`, `||`, `;`, `&`, `\n`) into atomic execution units. Enforces invariants atom-by-atom, preventing attackers from smuggling unauthorized commits or exfiltration inside benign local command chains.
+4. **Hawking Conservation Law for Clean Local Workspace**: Clean local development operations (TDD test execution, builds, linters, passive shell queries) with zero taint and zero network egress flow freely in 0ms without neural overblocking.
+5. **Kernel-Level Audit Log Immutability**: Native OS append-only flags (`chflags uappnd` on macOS) protect `firewall.jsonl` and `warden.jsonl` audit records against deletion (`rm`), truncation (`>`), or tampering without requiring root/sudo (*Auditor != Audited*).
+6. **Intent-Gated Local Git & Pre-Commit DLP**: 0ms execution for local Git operations; autonomous agent commits are blocked unless the user explicitly requested them in the prompt, guarded by pre-commit DLP diff scanning and rejection of `--no-verify`.
+7. **Local Laya System 1 Inference & Holographic Security Tensor**:
+   - `convaiinnovations/laya-typed-decisions` (421M ModernBERT-large) evaluates a multi-dimensional security tensor in a single ~25ms forward pass: orthogonal multi-class `intent_classification` (`choice`), ordinal `blast_radius` (`score`), and calibrated `no_secret_egress` (`noul`) using detailed semantic criteria.
+   - Fast ModernBERT-base for routine CLI commands; multilingual mmBERT for Italian.
    - Stephen Hawking Min-Pooling ($\min(P)$) over bounded holographic windows (Head/Mid/Tail) to prevent poisoned chunk dilution.
-   - Deterministic model triage: ModernBERT for English, multilingual mmBERT for Italian, typed-decisions for code mutations and taint.
-6. **Transparent Auto-Wake-on-Demand**: When the background inference service is in auto-hibernation (consuming 0.0 MB RAM), the firewall wakes it up automatically in 2-3 seconds on the first tool call without interrupting workflow.
-7. **Post-Execution DLP Sanitization**: Redacts private keys, AWS tokens, GitHub credentials, and Slack secrets before output reaches the agent transcript.
-8. **Fail-Closed & Forced Choice**: If the local inference daemon is unreachable and cannot be woken, execution halts. Human confirmation dialogs default strictly to **NO** on Enter.
+8. **Transparent Auto-Wake-on-Demand**: When the background inference service is in auto-hibernation (consuming 0.0 MB RAM), the firewall wakes it up automatically in 2-3 seconds on the first tool call without interrupting workflow.
+9. **Post-Execution DLP Sanitization**: Redacts private keys, AWS tokens, GitHub credentials, and Slack secrets before output reaches the agent transcript.
+10. **Fail-Closed & Forced Choice**: If the local inference daemon is unreachable and cannot be woken, execution halts. Human confirmation dialogs default strictly to **NO** on Enter.
 
 ---
 
@@ -62,7 +64,7 @@ Audit logs are persisted in `~/.cache/laya/firewall.jsonl`.
 
 ## Verification & Testing
 
-Run the 37-invariant antagonistic regression suite (stdlib Python):
+Run the 42-invariant antagonistic regression suite (stdlib Python):
 
 ```bash
 npm test

@@ -164,57 +164,35 @@ class InProcessTaintTracker {
   inspectAndPropagateBash(command: string, cwd?: string): void {
     if (!command) return;
 
-    // 1. Redirection: cat secret > dst.txt
-    const redirMatch = command.match(/(?:cat|grep|head|tail|base64|xxd|strings|tee)\s+([^\s|>]+)\s*>\s*([^\s|>]+)/);
-    if (redirMatch && redirMatch[1] && redirMatch[2]) {
-      const src = redirMatch[1].replace(/['"]/g, "");
-      const dst = redirMatch[2].replace(/['"]/g, "");
-      if (this.isPathSensitive(src, cwd)) {
-        this.markTainted(dst, cwd);
-        return;
-      }
-    }
+    // Detect destination sinks: redirection (> dst), tee (| tee dst), archives (tar/zip/7z dst), copy/move (cp/mv dst)
+    let dst: string | null = null;
+    const teeMatch = command.match(/\|\s*(?:sudo\s+)?tee\s+(?:-[a-zA-Z]+\s+)*([^\s|;&]+)/i);
+    const redirMatch = command.match(/>>?\s*([^\s|;&]+)/);
+    const archMatch = command.match(/\b(?:tar\s+-[a-zA-Z0-9]*f|zip\s+(?:--?[a-zA-Z0-9_=-]+\s+)*|7z\s+a\s+)\s*([^\s]+)/i);
+    const cpMatch = command.match(/\b(?:cp|mv|rsync|Copy-Item|Move-Item|install)\s+(?:-[a-zA-Z0-9]+\s+)*([^\s]+)\s+([^\s]+)/i);
 
-    // 2. Pipe to tee: cat secret | tee dst.txt
-    const teeMatch = command.match(/(?:cat|grep|head|tail|strings)\s+([^\s|>]+)\s*\|\s*(?:sudo\s+)?tee\s+(?:-[a-zA-Z]+\s+)*([^\s|>]+)/i);
-    if (teeMatch && teeMatch[1] && teeMatch[2]) {
-      const src = teeMatch[1].replace(/['"]/g, "");
-      const dst = teeMatch[2].replace(/['"]/g, "");
-      if (this.isPathSensitive(src, cwd)) {
-        this.markTainted(dst, cwd);
-        return;
-      }
-    }
-
-    // 3. File Copy / Move / Rsync: cp secret dst.txt
-    const cpMatch = command.match(/\b(?:cp|mv|rsync|Copy-Item|Move-Item)\s+(?:-[a-zA-Z0-9]+\s+)*([^\s]+)\s+([^\s]+)/i);
-    if (cpMatch && cpMatch[1] && cpMatch[2]) {
+    if (teeMatch && teeMatch[1]) {
+      dst = teeMatch[1].replace(/['"]/g, "");
+    } else if (redirMatch && redirMatch[1]) {
+      dst = redirMatch[1].replace(/['"]/g, "");
+    } else if (archMatch && archMatch[1]) {
+      dst = archMatch[1].replace(/['"]/g, "");
+    } else if (cpMatch && cpMatch[1] && cpMatch[2]) {
       const src = cpMatch[1].replace(/['"]/g, "");
-      const dst = cpMatch[2].replace(/['"]/g, "");
+      const target = cpMatch[2].replace(/['"]/g, "");
       if (this.isPathSensitive(src, cwd)) {
-        this.markTainted(dst, cwd);
-        return;
+        this.markTainted(target, cwd);
       }
+      return;
     }
 
-    // 4. Archive packing: tar -czf leak.tar.gz .env / zip leak.zip .env
-    const archiveMatch = command.match(/\b(?:tar\s+-[a-zA-Z0-9]*f|zip\s+(?:-[a-zA-Z0-9]+\s+)*)\s*([^\s]+)\s+([^\s]+)/i);
-    if (archiveMatch && archiveMatch[1] && archiveMatch[2]) {
-      const dst = archiveMatch[1].replace(/['"]/g, "");
-      const src = archiveMatch[2].replace(/['"]/g, "");
-      if (this.isPathSensitive(src, cwd)) {
-        this.markTainted(dst, cwd);
-        return;
-      }
-    }
-
-    // 5. Block copy: dd if=secret of=dst.txt
-    const ddMatch = command.match(/\bdd\s+.*if=([^\s]+)\s+.*of=([^\s]+)/i);
-    if (ddMatch && ddMatch[1] && ddMatch[2]) {
-      const src = ddMatch[1].replace(/['"]/g, "");
-      const dst = ddMatch[2].replace(/['"]/g, "");
-      if (this.isPathSensitive(src, cwd)) {
-        this.markTainted(dst, cwd);
+    if (dst && !dst.startsWith("/dev/null") && !dst.startsWith("/dev/zero")) {
+      const tokens = command.match(/[^@'"=<>|;&()\s]+/g) || [];
+      for (const tok of tokens) {
+        if (tok !== dst && this.isPathSensitive(tok, cwd)) {
+          this.markTainted(dst, cwd);
+          return;
+        }
       }
     }
   }
@@ -518,6 +496,9 @@ interface WindowEval {
   noSecretProb: number;
   alignedProb: number;
   riskScore: number;
+  adversarialIntent?: string;
+  adversarialIntentProb?: number;
+  blastRadiusScore?: number;
 }
 
 function extractTargetedWindows(rawText: string, windowCharLimit = 800): string[] {
@@ -545,6 +526,85 @@ function extractTargetedWindows(rawText: string, windowCharLimit = 800): string[
   }
 
   return [head, tail];
+}
+
+function buildQuestionsForModel(
+  targetModel: "multilingual" | "typed-decisions" | "english"
+): Record<string, any> {
+  if (targetModel === "typed-decisions") {
+    return {
+      intent_classification: {
+        type: "choice",
+        instructions: "Identify the true operational objective of this payload.",
+        criteria: {
+          benign_dev: "ordinary software engineering, compiling, testing, formatting, or workspace file updates",
+          reconnaissance: "discovering system architecture, reading network configuration, environment dump, or finding sensitive paths",
+          credential_harvesting: "reading, echoing, parsing, or accessing private keys, tokens, auth headers, or secret stores",
+          covert_exfiltration: "sending workspace data, files, or stolen credentials outbound via curl, netcat, sockets, or webhooks",
+          persistence_tampering: "modifying shell rc, cron, systemd, audit logs, or planting background reverse shells",
+        },
+      },
+      blast_radius: {
+        type: "score",
+        instructions: "Rate the operational blast radius and privilege scope of this action.",
+        criteria: [
+          "level 0: read-only workspace inspection or inert command",
+          "level 1: routine local modification of project files",
+          "level 2: touching external configs, credentials, or invoking network utilities",
+          "level 3: credential exfiltration, remote shellcode, or destructive filesystem tampering",
+        ],
+      },
+      no_secret_egress: {
+        type: "noul",
+        instructions: "Is this action completely free from credential leaks, token exfiltration, or private key exposure?",
+        criteria: {
+          true: "Zero secret egress or private key access",
+          false: "Accesses, transmits or exposes credentials or sensitive environment data",
+        },
+      },
+      is_safe_operation: {
+        type: "noul",
+        instructions: "Is this tool execution completely safe, non-destructive, and within normal development boundaries?",
+        criteria: {
+          true: "Safe, non-destructive, and normal developer operation",
+          false: "Dangerous, destructive, or unauthorized action",
+        },
+      },
+    };
+  }
+
+  // Base English & Multilingual System 1 Questions
+  return {
+    is_safe_operation: {
+      type: "noul",
+      instructions: "Is this tool execution completely safe, non-destructive, and within normal development boundaries?",
+      criteria: {
+        true: "Safe, non-destructive, and normal developer operation",
+        false: "Dangerous, destructive, or unauthorized action",
+      },
+    },
+    no_secret_egress: {
+      type: "noul",
+      instructions: "Is this action free from credential leaks, token exfiltration, or private key exposure?",
+      criteria: {
+        true: "Zero secret egress or private key access",
+        false: "Accesses, transmits or exposes credentials or sensitive environment data",
+      },
+    },
+    is_aligned_with_goal: {
+      type: "noul",
+      instructions: "Does this tool execution directly serve and align with the authorized user goal?",
+      criteria: {
+        true: "Directly serves the user request without drift",
+        false: "Unrelated side-effect, drift, or potential injection",
+      },
+    },
+    safety_score: {
+      type: "score",
+      instructions: "Rate the overall safety and compliance of this operation from 1 (critical hazard) to 5 (completely safe).",
+      criteria: ["1 - critical hazard", "2 - high risk", "3 - moderate risk", "4 - low risk", "5 - completely safe"],
+    },
+  };
 }
 
 let isWakingUp = false;
@@ -600,37 +660,7 @@ async function queryLayaServe(
     state,
     model: targetModel,
     lang: langParam,
-    questions: {
-      is_safe_operation: {
-        type: "noul",
-        instructions: "Is this tool execution completely safe, non-destructive, and within normal development boundaries?",
-        criteria: {
-          true: "Safe, non-destructive, and normal developer operation",
-          false: "Dangerous, destructive, or unauthorized action",
-        },
-      },
-      no_secret_egress: {
-        type: "noul",
-        instructions: "Is this action free from credential leaks, token exfiltration, or private key exposure?",
-        criteria: {
-          true: "Zero secret egress or private key access",
-          false: "Accesses, transmits or exposes credentials or sensitive environment data",
-        },
-      },
-      is_aligned_with_goal: {
-        type: "noul",
-        instructions: "Does this tool execution directly serve and align with the authorized user goal?",
-        criteria: {
-          true: "Directly serves the user request without drift",
-          false: "Unrelated side-effect, drift, or potential injection",
-        },
-      },
-      safety_score: {
-        type: "score",
-        instructions: "Rate the overall safety and compliance of this operation from 1 (critical hazard) to 5 (completely safe).",
-        criteria: ["1 - critical hazard", "2 - high risk", "3 - moderate risk", "4 - low risk", "5 - completely safe"],
-      },
-    },
+    questions: buildQuestionsForModel(targetModel),
   };
 
   try {
@@ -670,10 +700,33 @@ async function evaluateAction(
   cwd: string,
   userPrompt: string | null
 ): Promise<LayaDecision | null> {
-  // 1. Smart Read-Only Gating (Bypass in 0ms only if completely non-sensitive)
   const targetPath = String(args.path || args.file || args.command || args.query || "");
   let isTainted = false;
 
+  // 1. Audit Log Path Invariant (Zero-Tampering / Controllore != Controllato)
+  // Evaluated on canonical filesystem targets, never on brittle shell command verbs
+  const canonTarget = taintTracker.canonicalize(targetPath, cwd);
+  const isAuditTarget = canonTarget && (
+    canonTarget.includes(path.join(".cache", "laya")) ||
+    canonTarget.endsWith("laya_serve.log") ||
+    canonTarget.endsWith("firewall.jsonl") ||
+    canonTarget.endsWith("warden.jsonl")
+  );
+
+  if (isAuditTarget) {
+    if (toolName === "write" || toolName === "edit" || (toolName === "bash" && !BENIGN_SHELL_READ_REGEX.test(targetPath.trim()))) {
+      return {
+        requires_human_confirmation: false,
+        hard_block: true,
+        verdict: "BLOCK",
+        risk_score: 5,
+        is_tainted: false,
+        reason: "🛑 [Audit Security] I file di audit (~/.cache/laya/) sono protetti e immutabili. Modifica o cancellazione vietata (Regola: Controllore != Controllato).",
+      };
+    }
+  }
+
+  // 2. Smart Read-Only Gating (Bypass in 0ms if non-sensitive)
   if (SAFE_READONLY_TOOLS.has(toolName)) {
     if (!taintTracker.isPathSensitive(targetPath, cwd)) {
       return {
@@ -687,7 +740,7 @@ async function evaluateAction(
     isTainted = true;
   }
 
-  // 2. Hard Security Heuristics (<0.05ms) - Default Hard Block without prompt
+  // 3. Hard Security Heuristics (<0.05ms) - Drop shellcode & cloud IMDS probes
   const hardViolation = checkHardHeuristics(toolName, args);
   if (hardViolation) {
     const allowOverride = process.env.LAYA_ALLOW_OVERRIDE === "true" || process.env.LAYA_PROMPT_ALL === "true";
@@ -701,9 +754,10 @@ async function evaluateAction(
     };
   }
 
-  // 3. Taint Tracking Propagation & Matching
+  // 4. Intent-Gated Git Commits & Chained Pipeline Atomicity
   if (toolName === "bash") {
-    const cmd = String(args.command || "");
+    const cmd = String(args.command || "").trim();
+
     if (isLegitLayaBootstrap(cmd)) {
       return {
         requires_human_confirmation: false,
@@ -713,27 +767,48 @@ async function evaluateAction(
         reason: "Laya service bootstrap operation",
       };
     }
-    if (BENIGN_SHELL_READ_REGEX.test(cmd.trim()) && !taintTracker.isCommandTainted(cmd, cwd)) {
-      return {
-        requires_human_confirmation: false,
-        verdict: "ALLOW",
-        risk_score: 1,
-        is_tainted: false,
-        reason: "Benign passive shell inspection",
-      };
+
+    const atoms = splitCommandChain(cmd);
+
+    // Atomicity Check 1: Audit Log Tampering Gate per Atom
+    for (const atom of atoms) {
+      if (atomTouchesAuditPath(atom)) {
+        return {
+          requires_human_confirmation: false,
+          hard_block: true,
+          verdict: "BLOCK",
+          risk_score: 5,
+          is_tainted: false,
+          reason: "🛑 [Audit Security] I file di audit (~/.cache/laya/) sono protetti e immutabili. Modifica o cancellazione vietata (Regola: Controllore != Controllato).",
+        };
+      }
     }
+
+    // Atomicity Check 2: Intent-Gated Git Commits per Atom
     const userHasCommitIntent = COMMIT_INTENT_REGEX.test(userPrompt || "");
-    if (/\bgit\s+commit\b/i.test(cmd) && !userHasCommitIntent) {
-      return {
-        requires_human_confirmation: false,
-        hard_block: true,
-        verdict: "BLOCK",
-        risk_score: 5,
-        is_tainted: false,
-        reason: "Autonomous git commit forbidden. Explicit user commit intent required in prompt.",
-      };
+    for (const atom of atoms) {
+      if (/\bgit\s+commit\b/i.test(atom) && !userHasCommitIntent) {
+        return {
+          requires_human_confirmation: false,
+          hard_block: true,
+          verdict: "BLOCK",
+          risk_score: 5,
+          is_tainted: false,
+          reason: "🛡️ [Git Safety] Commit autonomo non autorizzato. L'agente non può committare da solo senza il tuo permesso esplicito. 👉 Se vuoi autorizzarlo, scrivi 'fai il commit' nel tuo messaggio.",
+        };
+      }
     }
-    if (isSafeLocalGitOperation(cmd, userHasCommitIntent) && !taintTracker.isCommandTainted(cmd, cwd)) {
+
+    // Atomicity Check 3: Multi-Hop Taint DAG Propagation per Atom
+    for (const atom of atoms) {
+      taintTracker.inspectAndPropagateBash(atom, cwd);
+      if (taintTracker.isCommandTainted(atom, cwd)) {
+        isTainted = true;
+      }
+    }
+
+    // Atomicity Check 4: Safe Local Git Fast-Path
+    if (isSafeLocalGitOperation(cmd, userHasCommitIntent) && !isTainted) {
       return {
         requires_human_confirmation: false,
         verdict: "ALLOW",
@@ -742,8 +817,23 @@ async function evaluateAction(
         reason: "Safe local git version control operation",
       };
     }
-    taintTracker.inspectAndPropagateBash(cmd, cwd);
-    if (!isTainted) isTainted = taintTracker.isCommandTainted(cmd, cwd);
+
+    // Atomicity Check 5: Hawking Conservation Law on Clean Local Chained Workspace
+    const hasNetworkOutbound = atoms.some((atom) =>
+      /\b(?:curl|wget|fetch|axios|urllib|http\.client|nc|ncat|ssh|scp|sftp|rsync|socket)\b/i.test(atom) ||
+      /https?:\/\//i.test(atom)
+    );
+    const hasSensitiveRedirect = atoms.some((atom) => />\s*[^&|;]*\.(?:env|pem|key|ssh|aws)/i.test(atom));
+
+    if (!isTainted && !hasNetworkOutbound && !hasSensitiveRedirect) {
+      return {
+        requires_human_confirmation: false,
+        verdict: "ALLOW",
+        risk_score: 1,
+        is_tainted: false,
+        reason: "Clean local chained workspace execution (zero taint, zero egress)",
+      };
+    }
   } else if (!isTainted && targetPath) {
     if (toolName === "write" || toolName === "edit") {
       if (taintTracker.isPathIntegrityProtected(targetPath, cwd)) {
@@ -751,6 +841,25 @@ async function evaluateAction(
       }
     }
     if (!isTainted) isTainted = taintTracker.isPathSensitive(targetPath, cwd);
+  }
+
+  // 5. Hawking Conservation Invariant: Local Clean Workspace Operations Bypass
+  // If the command is completely non-tainted and does not touch sensitive seeds,
+  // local development (TDD test execution, formatting, building) is inherently safe in 0ms.
+  if (toolName === "bash" && !isTainted) {
+    const cmd = String(args.command || "").trim();
+    const hasNetworkOutbound = /\b(?:curl|wget|fetch|axios|urllib|http\.client|nc|ncat|ssh|scp|sftp|rsync|socket)\b/i.test(cmd) || /https?:\/\//i.test(cmd);
+    const hasSensitiveRedirect = />\s*[^&|;]*\.(?:env|pem|key|ssh|aws)/i.test(cmd);
+
+    if (!hasNetworkOutbound && !hasSensitiveRedirect) {
+      return {
+        requires_human_confirmation: false,
+        verdict: "ALLOW",
+        risk_score: 1,
+        is_tainted: false,
+        reason: "Clean local workspace execution (zero taint, zero egress)",
+      };
+    }
   }
 
   // Bounded Holographic Horizon (Stephen Hawking & Kevin Mitnick Anti-Evasion)
@@ -802,10 +911,32 @@ async function evaluateAction(
       const safeProb = Number(answers.is_safe_operation?.noul ?? 1.0);
       const noSecretProb = Number(answers.no_secret_egress?.noul ?? 1.0);
       const alignedProb = Number(answers.is_aligned_with_goal?.noul ?? 1.0);
-      const rawScore = answers.safety_score?.score ?? 4;
+      let rawScore = answers.safety_score?.score ?? 4;
+
+      let adversarialIntent: string | undefined;
+      let adversarialIntentProb = 0;
+      let blastRadiusScore: number | undefined;
+
+      if (answers.intent_classification?.choice) {
+        adversarialIntent = answers.intent_classification.choice;
+        const probs = answers.intent_classification.probabilities || {};
+        adversarialIntentProb = Number(probs[adversarialIntent] ?? answers.intent_classification.answer_confidence ?? 0);
+      }
+      if (answers.blast_radius?.score !== undefined) {
+        blastRadiusScore = Number(answers.blast_radius.score);
+        rawScore = Math.max(1, 5 - Math.round(blastRadiusScore * 1.3));
+      }
       const rScore = Math.min(5, Math.max(1, 6 - Math.round(Number(rawScore))));
 
-      windowEvals.push({ safeProb, noSecretProb, alignedProb, riskScore: rScore });
+      windowEvals.push({
+        safeProb,
+        noSecretProb,
+        alignedProb,
+        riskScore: rScore,
+        adversarialIntent,
+        adversarialIntentProb,
+        blastRadiusScore,
+      });
     }
 
     // Min-Pooling Merge (Hawking Weakest-Link Invariant: a single poisoned chunk taints the composite verdict)
@@ -814,24 +945,38 @@ async function evaluateAction(
     const minAlignedProb = Math.min(...windowEvals.map((e) => e.alignedProb));
     const maxRiskScore = Math.max(...windowEvals.map((e) => e.riskScore));
 
-    const suspectSecretLeak = minNoSecretProb < 0.70;
+    const detectedIntents = windowEvals
+      .filter((e) => e.adversarialIntent && e.adversarialIntent !== "benign_dev" && (e.adversarialIntentProb ?? 0) >= 0.28)
+      .map((e) => `${e.adversarialIntent} (${((e.adversarialIntentProb ?? 0) * 100).toFixed(0)}%)`);
+
+    const maxBlastScore = Math.max(...windowEvals.map((e) => e.blastRadiusScore ?? 0));
+    const suspectAdversarial = detectedIntents.length > 0;
+    const suspectHighBlast = maxBlastScore >= 1.70;
+
+    const hasNetworkCapability = /\b(?:curl|wget|fetch|axios|urllib|http\.client|nc|ncat|ssh|scp|sftp|rsync|socket)\b/i.test(rawPayload) || /https?:\/\//i.test(rawPayload);
+    const suspectSecretLeak = (isTainted || hasNetworkCapability) && minNoSecretProb < 0.70;
     const suspectUnsafe = minSafeProb < 0.65;
     const suspectGoalDrift = userPrompt ? minAlignedProb < 0.60 : false;
 
     let verdict: "ALLOW" | "REQUIRE_CONFIRMATION" | "BLOCK" = "ALLOW";
-    if (suspectSecretLeak || suspectUnsafe || suspectGoalDrift || isTainted || entropyRisk) {
+    if (suspectSecretLeak || suspectUnsafe || suspectGoalDrift || isTainted || entropyRisk || suspectAdversarial || suspectHighBlast) {
       verdict = "REQUIRE_CONFIRMATION";
     }
 
-    const finalRiskScore = Math.max(maxRiskScore, (suspectSecretLeak || suspectUnsafe || isTainted || entropyRisk) ? 3 : 1);
+    const finalRiskScore = Math.max(
+      maxRiskScore,
+      (suspectSecretLeak || suspectUnsafe || isTainted || entropyRisk || suspectAdversarial || suspectHighBlast) ? 3 : 1
+    );
     const requiresHuman = !(verdict === "ALLOW" && finalRiskScore < 3);
 
     const reasons: string[] = [];
-    if (isTainted) reasons.push("Target path is tainted (credential source)");
-    if (entropyRisk) reasons.push(`Anomalous entropy / suspicious tokens detected (${suspiciousTokens.join(", ") || "high entropy blob"})`);
-    if (suspectSecretLeak) reasons.push(`Positive secret safety below threshold (min egress confidence ${(minNoSecretProb * 100).toFixed(0)}%)`);
-    if (suspectUnsafe) reasons.push(`Operation safety below threshold (min safe confidence ${(minSafeProb * 100).toFixed(0)}%)`);
-    if (suspectGoalDrift) reasons.push(`Action alignment drifts from user prompt (${(minAlignedProb * 100).toFixed(0)}%)`);
+    if (isTainted) reasons.push(`Percorso o file sensibile coinvolto (${targetPath})`);
+    if (entropyRisk) reasons.push(`Token sospetti o alta entropia (${suspiciousTokens.join(", ") || "blob cifrato"})`);
+    if (suspectAdversarial) reasons.push(`Intento anomalo rilevato: ${[...new Set(detectedIntents)].join(", ")}`);
+    if (suspectHighBlast) reasons.push(`Raggio d'impatto elevato sul sistema (${maxBlastScore.toFixed(1)}/3)`);
+    if (suspectSecretLeak) reasons.push(`Rischio di fuga credenziali o chiavi (affidabilità ${(minNoSecretProb * 100).toFixed(0)}%)`);
+    if (suspectUnsafe) reasons.push(`Azione potenzialmente distruttiva o non sicura (fiducia ${(minSafeProb * 100).toFixed(0)}%)`);
+    if (suspectGoalDrift) reasons.push(`Comando disallineato rispetto alla richiesta dell'utente (${(minAlignedProb * 100).toFixed(0)}%)`);
 
     const finalDecision: LayaDecision = {
       requires_human_confirmation: requiresHuman,
@@ -867,25 +1012,25 @@ async function confirmGuardrail(
     // Immediate categorical block without interactive prompt
     return {
       allowed: false,
-      reason: `[Laya Firewall] Violazione critica bloccata categoricamente: ${decision.reason}`,
+      reason: `[Laya Firewall] 🛑 Violazione di sicurezza bloccata: ${decision.reason}`,
     };
   }
 
   if (decision.requires_human_confirmation && decision.verdict !== "ALLOW") {
     let threat = target.replace(/#.*$/, "").trim() || target;
-    if (threat.length > 120) threat = threat.slice(0, 117) + "...";
+    if (threat.length > 100) threat = threat.slice(0, 97) + "...";
 
-    const promptTitle = `Laya Firewall [${decision.verdict} Rischio ${decision.risk_score}/5]: ${scope}`;
+    const promptTitle = `🛡️ [Laya Firewall] Rilevata operazione ad alto rischio (${decision.risk_score}/5): ${scope}`;
     const choice = await ctx.ui.select(
       promptTitle,
       [
-        `NO - Blocca (Default) | Target: ${threat}`,
-        `YES - Autorizza rischioso | Motivo: ${decision.reason || "Rischio elevato"}`
+        `❌ NO - Blocca operazione (Consigliato / Invio rapido) | ${threat}`,
+        `⚠️ YES - Autorizza comunque | Motivo: ${decision.reason || "Operazione rischiosa"}`
       ],
       { timeout: CONFIRM_TIMEOUT_MS }
     );
     return {
-      allowed: typeof choice === "string" && choice.startsWith("YES"),
+      allowed: typeof choice === "string" && (choice.startsWith("YES") || choice.startsWith("⚠️ YES")),
       reason: decision.reason || "high risk",
     };
   }
@@ -902,11 +1047,26 @@ function isLegitLayaBootstrap(cmd: string): boolean {
   return LAYA_SERVICE_MGMT_REGEX.test(clean) || LAYA_SERVE_BIN_REGEX.test(clean);
 }
 
+function splitCommandChain(cmd: string): string[] {
+  if (!cmd) return [];
+  return cmd
+    .split(/\s*(?:&&|\|\||;|;|&|\n)\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function atomTouchesAuditPath(atom: string): boolean {
+  if (!/(?:\.cache[\/\\]laya[\/\\](?:firewall|warden)\.jsonl|laya_serve\.log)/i.test(atom)) {
+    return false;
+  }
+  return !(BENIGN_SHELL_READ_REGEX.test(atom) && !/(?:>|\|)/.test(atom));
+}
+
 const COMMIT_INTENT_REGEX = /\b(?:commit|committa|committare|fai il commit)\b/i;
 
 function isSafeLocalGitOperation(cmd: string, userHasCommitIntent: boolean = false): boolean {
   if (/\b(?:push|remote\s+add|filter-branch)\b/i.test(cmd)) return false;
-  if (/(?:^|\s)(?:-f|--force)\b/i.test(cmd)) return false;
+  if (/(?:^|\s)(?:-f|--force|-n|--no-verify)\b/i.test(cmd)) return false;
 
   // Intent-Gated Git Commits: Autonomous commits forbidden without user order
   if (/\bgit\s+commit\b/i.test(cmd)) {
