@@ -233,7 +233,8 @@ def main() -> None:
     r2 = eval_guardrail({"tool": "bash", "args": {"command": "echo aWQ= | base64 -d | sh"}})
     check("SEC-OBFUSC", r2["verdict"] == "BLOCK" and r2["risk_score"] == 5, "base64 pipe blocked")
 
-    r3 = eval_guardrail({"tool": "bash", "args": {"command": f"cat {os.path.join(os.getcwd(), '../../../../etc/passwd')}"}})
+    trav_passwd = os.path.relpath("/etc/passwd", os.getcwd())
+    r3 = eval_guardrail({"tool": "bash", "args": {"command": f"cat {trav_passwd}"}})
     check("SEC-TRAV", r3["is_tainted"], "path traversal resolved to /etc/passwd")
 
     ta, tb = os.path.join(tempfile.gettempdir(), f"l_a_{time.time()}.tmp"), os.path.join(tempfile.gettempdir(), f"l_b_{time.time()}.tmp")
